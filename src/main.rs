@@ -144,8 +144,8 @@ fn get_suite_data(client: &reqwest::Client,
 enum CoverageType {
     NotRun,
     NotCovered,
-    MochitestOnly,
-    WptOnly,
+    Suite1Only,
+    Suite2Only,
     Both
 }
 
@@ -154,27 +154,27 @@ struct CoverageDifference {
     line_count: i64,
     coverable_count: i64,
     covered_count: i64,
-    mochitest_only_count: i64,
-    wpt_only_count: i64,
+    suite_1_only_count: i64,
+    suite_2_only_count: i64,
     both_count: i64,
 }
 
-fn coverage_difference(wpt_coverage: &[i64], mochitest_coverage:&[i64]) -> CoverageDifference {
+fn coverage_difference(suite_1_coverage: &[i64], suite_2_coverage:&[i64]) -> CoverageDifference {
     let mut line_differences = Vec::new();
-    let mut mochitest_only_count = 0;
-    let mut wpt_only_count = 0;
+    let mut suite_2_only_count = 0;
+    let mut suite_1_only_count = 0;
     let mut both_count = 0;
 
-    let line_count = if mochitest_coverage.len() != wpt_coverage.len() {
+    let line_count = if suite_2_coverage.len() != suite_1_coverage.len() {
         eprintln!("WARNING: line counts differ");
-        cmp::min(wpt_coverage.len(), mochitest_coverage.len())
+        cmp::min(suite_1_coverage.len(), suite_2_coverage.len())
     } else {
-        wpt_coverage.len()
+        suite_1_coverage.len()
     } as i64;
 
     let mut coverable_count = line_count;
-    for (wpt_hit_count, mochitest_hit_count) in wpt_coverage.iter().zip(mochitest_coverage.iter()) {
-        let coverage_type = match (wpt_hit_count, mochitest_hit_count) {
+    for (suite_1_hit_count, suite_2_hit_count) in suite_1_coverage.iter().zip(suite_2_coverage.iter()) {
+        let coverage_type = match (suite_1_hit_count, suite_2_hit_count) {
             (-1, -1) => {
                 coverable_count -= 1;
                 CoverageType::NotRun
@@ -183,48 +183,67 @@ fn coverage_difference(wpt_coverage: &[i64], mochitest_coverage:&[i64]) -> Cover
                 CoverageType::NotCovered
             },
             (x, y) if *x > 0 && *y <= 0 => {
-                wpt_only_count += 1;
-                CoverageType::WptOnly
+                suite_1_only_count += 1;
+                CoverageType::Suite1Only
             },
             (x, y) if *x <= 0 && *y > 0 => {
-                mochitest_only_count += 1;
-                CoverageType::MochitestOnly
+                suite_2_only_count += 1;
+                CoverageType::Suite2Only
             },
             (_, _) => {
                 both_count += 1;
                 CoverageType::Both
             }
         };
-        //println!("{} {} {:?}", wpt_hit_count, mochitest_hit_count, coverage_type);
+        //println!("{} {} {:?}", suite_1_hit_count, suite_2_hit_count, coverage_type);
         line_differences.push(coverage_type);
     }
-    let mut covered_count = both_count + wpt_only_count + mochitest_only_count;
+
+    let covered_count = both_count + suite_1_only_count + suite_2_only_count;
     CoverageDifference {
         line_differences,
         line_count,
         coverable_count,
         covered_count,
-        mochitest_only_count,
-        wpt_only_count,
+        suite_2_only_count,
+        suite_1_only_count,
         both_count,
     }
 }
 
+fn zero_coverage(other_data: &[i64]) -> Vec<i64> {
+    other_data.iter().map(|x| if *x == -1 {-1} else {0}).collect()
+}
 
-fn get_differences(wpt_data: CoverageMap, mochitest_data: CoverageMap) -> BTreeMap<String, CoverageDifference> {
+fn get_differences(suite_1_data: CoverageMap, suite_2_data: CoverageMap) -> BTreeMap<String, CoverageDifference> {
     let mut rv = BTreeMap::new();
-    for (path, wpt_coverage) in wpt_data.iter() {
-        if wpt_coverage.path_type == "directory" {
+    for (path, suite_1_coverage) in suite_1_data.iter() {
+        if suite_1_coverage.path_type == "directory" {
             continue;
         }
-        if let Some(ref wpt_coverage_vec) = wpt_coverage.coverage {
-            if let Some(ref mochitest_coverage) = mochitest_data.get(path) {
-                if let Some(ref mochitest_coverage_vec) = mochitest_coverage.coverage {
+        if let Some(ref suite_1_coverage_vec) = suite_1_coverage.coverage {
+            if let Some(ref suite_2_coverage) = suite_2_data.get(path) {
+                if let Some(ref suite_2_coverage_vec) = suite_2_coverage.coverage {
                     rv.insert(path.clone(),
-                              coverage_difference(wpt_coverage_vec, mochitest_coverage_vec));
+                              coverage_difference(suite_1_coverage_vec, suite_2_coverage_vec));
                 }
+            } else {
+                let suite_2_coverage_vec = zero_coverage(&suite_1_coverage_vec);
+                rv.insert(path.clone(),
+                          coverage_difference(suite_1_coverage_vec, &suite_2_coverage_vec));
+
             }
         }
+    }
+    for (path, suite_2_coverage) in suite_2_data.iter() {
+            if !suite_1_data.contains_key(path) {
+                if let Some(ref suite_2_coverage_vec) = suite_2_coverage.coverage {
+                    let suite_1_coverage_vec = zero_coverage(&suite_2_coverage_vec);
+                    rv.insert(path.clone(),
+                              coverage_difference(&suite_1_coverage_vec, suite_2_coverage_vec));
+
+                }
+            }
     }
     rv
 }
@@ -238,9 +257,13 @@ fn get_latest_changeset(client: &reqwest::Client) -> Result<String> {
 }
 
 #[derive(Debug, StructOpt)]
-#[structopt(name = "wptcoverage", about = "Download and process wpt coverage data")]
+#[structopt(name = "coverage", about = "Download and process wpt coverage data")]
 struct Opt {
-    changeset: Option<String>
+    #[structopt(long)]
+    changeset: Option<String>,
+    suite_1: String,
+    suite_2: String,
+    base_paths: String
 }
 
 
@@ -254,12 +277,16 @@ fn run() -> Result<()> {
 
     let base_path = PathBuf::from(format!("data/{}", changeset));
 
-    let wpt_data = get_suite_data(&client, &changeset, &base_path, "web-platform-tests", &["dom"])?;
-    let mochitest_data = get_suite_data(&client, &changeset, &base_path, "mochitest-plain-chunked", &["dom"])?;
+    let gecko_base_paths = opt.base_paths.split(',').map(|x| x.trim()).collect::<Vec<&str>>();
 
-    let differences = get_differences(wpt_data, mochitest_data);
+    let suite_1_data = get_suite_data(&client, &changeset, &base_path, &opt.suite_1, &gecko_base_paths)?;
+    let suite_2_data = get_suite_data(&client, &changeset, &base_path, &opt.suite_2, &gecko_base_paths)?;
 
-    println!("path, wpt only, mochitest only, both, total covered, total coverable, total lines, wpt-only percent, mochitest-only percent, coverage percent");
+    let differences = get_differences(suite_1_data, suite_2_data);
+
+    println!("path, {} only, {} only, both, total covered, total coverable, total lines, {}-only percent, {}-only percent, coverage percent",
+             &opt.suite_1, &opt.suite_2, &opt.suite_1, &opt.suite_2);
+
     for (path, coverage_difference) in differences.iter() {
 
         let percent = |count: i64| {
@@ -268,14 +295,14 @@ fn run() -> Result<()> {
 
         println!("\"{}\", {}, {}, {}, {}, {}, {}, {}, {}, {}",
                  path,
-                 coverage_difference.wpt_only_count,
-                 coverage_difference.mochitest_only_count,
+                 coverage_difference.suite_1_only_count,
+                 coverage_difference.suite_2_only_count,
                  coverage_difference.both_count,
                  coverage_difference.covered_count,
                  coverage_difference.coverable_count,
                  coverage_difference.line_count,
-                 percent(coverage_difference.wpt_only_count),
-                 percent(coverage_difference.mochitest_only_count),
+                 percent(coverage_difference.suite_1_only_count),
+                 percent(coverage_difference.suite_2_only_count),
                  percent(coverage_difference.covered_count),
         );
     }
